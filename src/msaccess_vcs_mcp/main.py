@@ -17,6 +17,7 @@ _callback_server = None
 
 # Session ID generated at startup for option override scoping
 _session_id = uuid.uuid4().hex[:8]
+_shutdown_logged = False
 
 
 def _start_callback_server(config: dict) -> str | None:
@@ -102,6 +103,15 @@ def _cleanup_session() -> None:
         print(f"Session cleanup skipped: {e}", file=sys.stderr)
 
 
+def _log_server_shutdown() -> None:
+    """Best-effort lifecycle marker when the Python process exits."""
+    global _shutdown_logged
+    if _shutdown_logged:
+        return
+    _shutdown_logged = True
+    log_diagnostic_event("server_shutdown", session_id=_session_id)
+
+
 def main() -> None:
     """Main entry point for the MCP server."""
     # Always-on lifecycle event: emitted before .env discovery so we still
@@ -113,19 +123,40 @@ def main() -> None:
         mcp_version=__version__,
         session_id=_session_id,
     )
+    atexit.register(_log_server_shutdown)
 
     # Load configuration (.env files from project root)
     config = get_config()
     
     # Verify Access COM is available
+    log_diagnostic_event("startup_access_validation_start", session_id=_session_id)
     try:
         validate_access_installation()
+        log_diagnostic_event(
+            "startup_access_validation_result",
+            session_id=_session_id,
+            success=True,
+        )
         print("✓ Microsoft Access COM automation available", file=sys.stderr)
     except ImportError as e:
+        log_diagnostic_event(
+            "startup_access_validation_result",
+            session_id=_session_id,
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
         print(f"Error: {e}", file=sys.stderr)
         print("Install pywin32: pip install pywin32", file=sys.stderr)
         sys.exit(1)
     except RuntimeError as e:
+        log_diagnostic_event(
+            "startup_access_validation_result",
+            session_id=_session_id,
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     
@@ -172,7 +203,14 @@ def main() -> None:
         print("--- End validation ---\n", file=sys.stderr)
     
     # Start callback server for VBA progress updates
+    log_diagnostic_event("startup_callback_server_start", session_id=_session_id)
     callback_url = _start_callback_server(config)
+    log_diagnostic_event(
+        "startup_callback_server_result",
+        session_id=_session_id,
+        enabled=callback_url is not None,
+        callback_url=callback_url,
+    )
     
     # Store callback URL in environment for tools to access
     if callback_url:
@@ -212,7 +250,18 @@ def main() -> None:
 
     # Import and run MCP server
     from .tools import mcp
-    mcp.run(transport="stdio")
+    log_diagnostic_event("mcp_stdio_run_start", session_id=_session_id)
+    try:
+        mcp.run(transport="stdio")
+        log_diagnostic_event("mcp_stdio_run_returned", session_id=_session_id)
+    except BaseException as e:
+        log_diagnostic_event(
+            "fatal_exit",
+            session_id=_session_id,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        raise
 
 
 if __name__ == "__main__":

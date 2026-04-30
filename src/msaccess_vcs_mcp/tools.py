@@ -55,6 +55,7 @@ from .security import (
     check_write_permission,
 )
 from .usage_logging import log_code_execution, log_diagnostic_event, with_logging
+from .vba_worker_manager import run_vba_resilient
 
 
 def _get_operation_manager():
@@ -1500,7 +1501,8 @@ def vcs_call_vba(
 @vcs_tool("vcs_run_vba")
 def vcs_run_vba(
     database_path: str,
-    code: str
+    code: str,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """
     Execute agent-generated VBA code in a temporary module.
@@ -1554,6 +1556,8 @@ def vcs_run_vba(
     Args:
         database_path: Path to Access database (.accdb, .accda, .mdb)
         code: VBA code to execute (statements, not just an expression)
+        timeout_seconds: Optional parent-side timeout. Defaults to
+            ACCESS_VCS_RUN_VBA_TIMEOUT_SEC (45 seconds).
     
     Returns:
         Dictionary with `success`, `result`, and on failure `error`,
@@ -1563,23 +1567,25 @@ def vcs_run_vba(
     try:
         db_path = validate_database_path(database_path)
         log_code_execution("vcs_run_vba", str(db_path), code, code_type="vba")
-        
-        with AccessConnection(str(db_path)) as conn:
-            app, db = conn.connect()
-            
-            config = get_config()
-            addin = VCSAddinIntegration(config.get("ACCESS_VCS_ADDIN_PATH"))
-            addin.load_addin(app, db_path=str(db_path))
-            
-            result_json = addin.call_sync("RunVBA", code)
-            
-            if isinstance(result_json, str):
-                try:
-                    return json.loads(result_json)
-                except json.JSONDecodeError:
-                    return {"success": True, "result": result_json}
-            
-            return {"success": True, "result": result_json}
+
+        config = get_config()
+        worker_result = run_vba_resilient(
+            database_path=str(db_path),
+            code=code,
+            addin_path=config.get("ACCESS_VCS_ADDIN_PATH"),
+            timeout_seconds=timeout_seconds,
+        )
+        if not worker_result.get("success"):
+            return worker_result
+
+        result_json = worker_result.get("result")
+        if isinstance(result_json, str):
+            try:
+                return json.loads(result_json)
+            except json.JSONDecodeError:
+                return {"success": True, "result": result_json}
+
+        return {"success": True, "result": result_json}
     
     except Exception as e:
         return {"success": False, "error": str(e)}

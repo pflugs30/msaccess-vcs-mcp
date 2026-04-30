@@ -87,6 +87,10 @@ Key variables:
 - `ACCESS_VCS_DATABASE` — target database path
 - `ACCESS_VCS_DISABLE_WRITES` — set `true` to block write operations
 - `ACCESS_VCS_ENABLE_LOGGING` — set `true` to enable usage logging
+- `ACCESS_VCS_RUN_VBA_TIMEOUT_SEC` — parent-side timeout for `vcs_run_vba` worker processes (default 45s)
+- `ACCESS_VCS_RECOVERY_PROBE_TIMEOUT_SEC` — timeout for automatic Access/add-in recovery probes after a VBA timeout or COM disconnect (default 10s)
+
+`vcs_run_vba` executes Access COM work in a short-lived child Python process. If a snippet hangs because Access is in break mode, blocked on a modal dialog, or otherwise unresponsive, the MCP server kills only that child process and returns a recoverable timeout. It does **not** kill `MSACCESS.EXE` or close user-owned Access windows; after Access becomes responsive, the next call runs an automatic probe and resumes normal operation.
 
 ## Logging
 

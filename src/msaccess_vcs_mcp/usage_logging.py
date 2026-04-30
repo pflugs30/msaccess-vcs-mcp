@@ -834,6 +834,75 @@ def log_addin_probe(
     _write_log_entry(entry)
 
 
+def log_vba_worker_event(
+    event: str,
+    database_path: str,
+    operation: str,
+    duration_ms: float | None = None,
+    success: bool | None = None,
+    timed_out: bool = False,
+    error: str | None = None,
+    error_pattern: str | None = None,
+    phase: str | None = None,
+    exit_code: int | None = None,
+    retry: bool = False,
+) -> None:
+    """Log parent-side lifecycle events for the isolated VBA worker."""
+    if not _initialize_logging():
+        return
+
+    entry: dict[str, Any] = {
+        "event": event,
+        "database": database_path,
+        "operation": operation,
+        "timed_out": timed_out,
+        "retry": retry,
+    }
+    if duration_ms is not None:
+        entry["duration_ms"] = duration_ms
+    if success is not None:
+        entry["success"] = success
+    if phase:
+        entry["phase"] = phase
+    if exit_code is not None:
+        entry["exit_code"] = exit_code
+    if error:
+        entry["error"] = _truncate_string(error, max_length=500)
+        entry["error_pattern"] = error_pattern or _extract_error_pattern(error)
+    elif error_pattern:
+        entry["error_pattern"] = error_pattern
+
+    _write_log_entry(entry)
+
+
+def log_com_recovery_event(
+    event: str,
+    database_path: str,
+    status: str,
+    success: bool | None = None,
+    error: str | None = None,
+    error_pattern: str | None = None,
+) -> None:
+    """Log COM recovery state transitions and probe outcomes."""
+    if not _initialize_logging():
+        return
+
+    entry: dict[str, Any] = {
+        "event": event,
+        "database": database_path,
+        "status": status,
+    }
+    if success is not None:
+        entry["success"] = success
+    if error:
+        entry["error"] = _truncate_string(error, max_length=500)
+        entry["error_pattern"] = error_pattern or _extract_error_pattern(error)
+    elif error_pattern:
+        entry["error_pattern"] = error_pattern
+
+    _write_log_entry(entry)
+
+
 def get_log_file_path() -> Path | None:
     """
     Get the current log file path.

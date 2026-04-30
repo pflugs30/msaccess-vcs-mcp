@@ -18,6 +18,8 @@ from msaccess_vcs_mcp.usage_logging import (
     log_tool_call,
     log_code_execution,
     log_addin_probe,
+    log_com_recovery_event,
+    log_vba_worker_event,
     with_logging,
     is_logging_enabled,
     get_log_file_path,
@@ -705,6 +707,61 @@ class TestLogAddinProbe:
                 duration_ms=1.0,
                 success=True,
             )
+
+
+class TestRecoveryLogging:
+    """Tests for worker and recovery instrumentation events."""
+
+    def test_logs_vba_worker_timeout(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        with patch.dict(
+            os.environ,
+            {"ACCESS_VCS_ENABLE_LOGGING": "true", "ACCESS_VCS_LOG_DIR": str(log_dir)},
+            clear=False,
+        ):
+            _initialize_logging()
+            log_vba_worker_event(
+                "vba_worker_timeout",
+                database_path="C:\\test.accdb",
+                operation="run_vba",
+                duration_ms=45000.0,
+                success=False,
+                timed_out=True,
+                error="VBA worker timed out after 45 seconds",
+                error_pattern="timeout",
+                phase="run_vba",
+            )
+
+        lines = (log_dir / "vcs-mcp-usage.jsonl").read_text().strip().split("\n")
+        entry = json.loads(lines[-1])
+        assert entry["event"] == "vba_worker_timeout"
+        assert entry["database"] == "C:\\test.accdb"
+        assert entry["operation"] == "run_vba"
+        assert entry["success"] is False
+        assert entry["timed_out"] is True
+        assert entry["error_pattern"] == "timeout"
+
+    def test_logs_com_recovery_probe_result(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        with patch.dict(
+            os.environ,
+            {"ACCESS_VCS_ENABLE_LOGGING": "true", "ACCESS_VCS_LOG_DIR": str(log_dir)},
+            clear=False,
+        ):
+            _initialize_logging()
+            log_com_recovery_event(
+                "com_recovery_probe_result",
+                database_path="C:\\test.accdb",
+                status="recovered",
+                success=True,
+            )
+
+        lines = (log_dir / "vcs-mcp-usage.jsonl").read_text().strip().split("\n")
+        entry = json.loads(lines[-1])
+        assert entry["event"] == "com_recovery_probe_result"
+        assert entry["database"] == "C:\\test.accdb"
+        assert entry["status"] == "recovered"
+        assert entry["success"] is True
 
 
 class TestDiagnosticLogging:

@@ -1,5 +1,4 @@
 <!-- BEGIN HEADER -->
-
 # Decision Log
 
 A reverse-chronological journal of architectural and strategic decisions.
@@ -72,6 +71,25 @@ overturned. Always scan older entries for claims that conflict with the new
 decision — agents reading the log linearly will otherwise encounter
 contradictory guidance.
 <!-- END HEADER -->
+
+---
+
+## 2026-04-30 — Isolate `vcs_run_vba` behind a timeout-controlled worker
+
+**Trigger**: A long-running `vcs_run_vba` call left Cursor's MCP connection closed, followed by reconnect attempts timing out and later calls failing with `Not connected`. The existing add-in probe had `ACCESS_VCS_PROBE_TIMEOUT_SEC`, but the actual `Application.Run(..., "RunVBA", code)` call still happened synchronously inside the stdio MCP process. If Access entered VBA break mode, showed a modal dialog, or never returned from the submitted snippet, the server process could hang or die before it could return a structured error.
+
+**Options explored**:
+- **Keep synchronous COM and rely on the existing add-in probe**. Rejected: the probe only proves `GetVCSVersion` responds before dispatch; it does not bound the later arbitrary `RunVBA` call where the observed failure occurred.
+- **Wrap `RunVBA` in another daemon thread inside the MCP process**. Similar to the add-in probe pattern and cheap to implement, but rejected for arbitrary VBA: a wedged worker thread still lives in the stdio process, COM apartment behavior is harder to reason about, and repeated failures can pile up inside the server that must stay responsive.
+- **Use the async callback path (`APIAsync` + `OperationManager`)**. Good for supported export/import/build workflows, but not chosen for ad-hoc VBA snippets because `RunVBA` does not currently have a detached async add-in contract and arbitrary code may not emit reliable callbacks.
+- **Kill or restart `MSACCESS.EXE` automatically**. Rejected: Access may be user-owned and may contain unsaved work. The server can abandon its own worker, but it must not destroy a user's Access session to heal itself.
+- **Launch a short-lived Python COM worker per `vcs_run_vba` call (chosen)**. The stdio MCP process now starts a child worker, waits with a hard timeout, and kills only that child process if Access does not respond. The parent remains connected and can return a recoverable timeout.
+
+**Decision**: `vcs_run_vba` uses process isolation for the risky Access COM call. Parent-side `VBAWorkerManager` launches `python -m msaccess_vcs_mcp.vba_worker` with a temp-file JSON request/response protocol, enforces `ACCESS_VCS_RUN_VBA_TIMEOUT_SEC` (default 45s, overridable per call), and returns structured failures with `recoverable`, `timed_out`, `error_pattern`, and recovery guidance. A per-database `COMRecoveryManager` classifies common COM transport failures (`rpc_unavailable`, `call_rejected`, `object_disconnected`, `connection_closed`, timeout, Access not found) and runs a short `ACCESS_VCS_RECOVERY_PROBE_TIMEOUT_SEC` probe before later calls. It retries only pre-dispatch failures after a successful probe; failures during `run_vba` are not auto-retried because the snippet may already have started and may not be idempotent.
+
+**What this rules out**: Future fixes for hung arbitrary VBA should not run `RunVBA` directly in the MCP stdio process again. Do not solve this class of failure by killing `MSACCESS.EXE` unless ownership tracking proves the server created an isolated Access instance and no user work can be lost. The worker boundary is intentionally heavier than the add-in probe's daemon-thread timeout because arbitrary VBA has much higher hang risk and unknown side effects. If the add-in later grows a safe async `RunVBA` contract with completion callbacks, this decision can be revisited, but it must preserve the parent process's ability to return before the MCP client times out.
+
+**Relevant files**: `src/msaccess_vcs_mcp/vba_worker.py` (child process entry point), `src/msaccess_vcs_mcp/vba_worker_manager.py` (parent-side timeout, probe, retry policy), `src/msaccess_vcs_mcp/com_recovery.py` (classification and per-database state), `src/msaccess_vcs_mcp/tools.py` (`vcs_run_vba` now delegates to the worker manager), `src/msaccess_vcs_mcp/usage_logging.py` (worker/recovery events), `src/msaccess_vcs_mcp/main.py` (startup/shutdown/fatal diagnostics), `.env.example`, `AGENTS.md`, `tests/test_vba_worker_manager.py`, `tests/test_usage_logging.py`.
 
 ---
 
