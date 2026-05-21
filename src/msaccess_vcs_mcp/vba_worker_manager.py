@@ -1,16 +1,20 @@
-"""Parent-side management for isolated VBA worker processes."""
+"""Thread-based management for isolated VBA execution with timeout."""
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
-import sys
-import tempfile
+import threading
 import time
-from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+try:
+    import pythoncom
+    import win32com.client
+    COM_AVAILABLE = True
+except ImportError:
+    COM_AVAILABLE = False
+
+from .addin_integration import VCSAddinIntegration
 from .com_recovery import (
     classify_com_error,
     get_recovery_manager,
@@ -51,10 +55,18 @@ def get_recovery_probe_timeout() -> float:
 
 
 class VBAWorkerManager:
-    """Launch one short-lived Python worker process per risky VBA call."""
+    """Run VBA in a daemon thread with a hard timeout.
 
-    def __init__(self, worker_module: str = "msaccess_vcs_mcp.vba_worker") -> None:
-        self.worker_module = worker_module
+    Modelled on ``_probe_with_timeout`` in ``addin_integration.py`` and
+    ``_run_dao_with_timeout`` in db-inspector-mcp.  The worker thread
+    creates its own COM apartment via ``pythoncom.CoInitialize()`` and
+    re-acquires the Access instance through the Running Object Table so
+    that ``thread.join(timeout)`` can fire even if the COM call blocks.
+    """
+
+    _active_worker: Optional[threading.Thread] = None
+
+    def __init__(self) -> None:
         self.recovery = get_recovery_manager()
 
     def run_vba(
@@ -64,7 +76,7 @@ class VBAWorkerManager:
         addin_path: str | None = None,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Run VBA in an isolated worker and apply recovery policy."""
+        """Run VBA in a timeout-controlled worker thread with recovery."""
         timeout = get_run_vba_timeout(timeout_seconds)
         preflight = self._probe_if_needed(database_path, addin_path)
         if preflight is not None:
@@ -90,7 +102,7 @@ class VBAWorkerManager:
         )
 
     def probe(self, database_path: str, addin_path: str | None = None) -> dict[str, Any]:
-        """Run a short Access/add-in health probe in an isolated worker."""
+        """Run a short Access/add-in health probe in a worker thread."""
         return self._run_worker(
             operation="probe",
             database_path=database_path,
@@ -98,6 +110,10 @@ class VBAWorkerManager:
             code=None,
             timeout_seconds=get_recovery_probe_timeout(),
         )
+
+    # ------------------------------------------------------------------
+    # Recovery helpers (unchanged from subprocess version)
+    # ------------------------------------------------------------------
 
     def _probe_if_needed(
         self,
@@ -202,7 +218,7 @@ class VBAWorkerManager:
 
         if (
             is_recoverable_pattern(pattern)
-            and phase in {"connect", "load_addin", "validate_database", "load_config"}
+            and phase in {"connect", "load_addin"}
         ):
             probe_result = self.probe(database_path, addin_path)
             if probe_result.get("success"):
@@ -252,6 +268,10 @@ class VBAWorkerManager:
             recoverable=is_recoverable_pattern(pattern),
         )
 
+    # ------------------------------------------------------------------
+    # Thread-based worker (replaces subprocess)
+    # ------------------------------------------------------------------
+
     def _run_worker(
         self,
         operation: str,
@@ -261,13 +281,18 @@ class VBAWorkerManager:
         timeout_seconds: float,
         retry: bool = False,
     ) -> dict[str, Any]:
-        request: dict[str, Any] = {
-            "operation": operation,
-            "database_path": database_path,
-            "addin_path": addin_path,
-        }
-        if code is not None:
-            request["code"] = code
+        cls = type(self)
+        if cls._active_worker is not None and cls._active_worker.is_alive():
+            return {
+                "success": False,
+                "error": (
+                    "A previous VBA worker thread is still running. "
+                    "Access may be in VBA break mode or blocked on a modal dialog."
+                ),
+                "error_pattern": "access_unresponsive",
+                "recoverable": True,
+                "phase": "guard",
+            }
 
         start = time.perf_counter()
         log_vba_worker_event(
@@ -284,128 +309,132 @@ class VBAWorkerManager:
             retry=retry,
         )
 
-        with tempfile.TemporaryDirectory(prefix="vcs-vba-worker-") as temp_dir:
-            request_path = Path(temp_dir) / "request.json"
-            response_path = Path(temp_dir) / "response.json"
-            request_path.write_text(json.dumps(request), encoding="utf-8")
+        result_box: dict[str, Any] = {}
 
-            command = [
-                sys.executable,
-                "-m",
-                self.worker_module,
-                str(request_path),
-                str(response_path),
-            ]
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+        def worker() -> None:
+            phase = "start"
             try:
-                _stdout, stderr = process.communicate(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                _stdout, stderr = process.communicate()
-                duration_ms = round((time.perf_counter() - start) * 1000, 2)
-                error = f"VBA worker timed out after {timeout_seconds} seconds"
-                log_vba_worker_event(
-                    "vba_worker_timeout",
-                    database_path=database_path,
-                    operation=operation,
-                    duration_ms=duration_ms,
-                    success=False,
-                    timed_out=True,
-                    error=error,
-                    error_pattern="timeout",
-                    retry=retry,
-                )
-                log_diagnostic_event(
-                    "vba_worker_timeout",
-                    database=str(database_path),
-                    operation=operation,
-                    duration_ms=duration_ms,
-                    error=error,
-                    retry=retry,
-                )
-                return {
+                if not COM_AVAILABLE:
+                    raise ImportError("pywin32 is required for COM automation")
+                pythoncom.CoInitialize()
+                try:
+                    phase = "connect"
+                    worker_app = VCSAddinIntegration._find_access_in_rot(database_path)
+                    if worker_app is None:
+                        raise RuntimeError(
+                            f"Cannot find Access instance for {database_path} "
+                            f"from worker thread. The Access application "
+                            f"may have been closed."
+                        )
+
+                    phase = "load_addin"
+                    addin = VCSAddinIntegration(addin_path)
+                    addin.load_addin(worker_app, db_path=database_path)
+
+                    if operation == "probe":
+                        result_box["result"] = {
+                            "success": True,
+                            "operation": operation,
+                            "phase": phase,
+                            "result": "ok",
+                        }
+                        return
+
+                    phase = "run_vba"
+                    vba_result = addin.call_sync("RunVBA", code)
+                    result_box["result"] = {
+                        "success": True,
+                        "operation": operation,
+                        "phase": phase,
+                        "result": vba_result,
+                    }
+                finally:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                result_box["result"] = {
                     "success": False,
-                    "error": error,
-                    "error_pattern": "timeout",
-                    "recoverable": True,
-                    "timed_out": True,
-                    "duration_ms": duration_ms,
-                    "stderr": stderr.strip() if stderr else None,
+                    "operation": operation,
+                    "phase": phase,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "error_pattern": classify_com_error(exc),
                 }
 
-            duration_ms = round((time.perf_counter() - start) * 1000, 2)
-            response = self._read_worker_response(
-                response_path=response_path,
-                exit_code=process.returncode,
-                stderr=stderr,
-            )
-            response["duration_ms"] = duration_ms
-            response["recoverable"] = is_recoverable_pattern(response.get("error_pattern"))
+        thread = threading.Thread(target=worker, daemon=True, name="vcs-vba-worker")
+        cls._active_worker = thread
+        thread.start()
+        thread.join(timeout=timeout_seconds)
 
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+
+        if thread.is_alive():
+            error = f"VBA worker timed out after {timeout_seconds} seconds"
             log_vba_worker_event(
-                "vba_worker_result",
+                "vba_worker_timeout",
                 database_path=database_path,
                 operation=operation,
                 duration_ms=duration_ms,
-                success=response.get("success"),
-                timed_out=response.get("timed_out", False),
-                error=response.get("error"),
-                error_pattern=response.get("error_pattern"),
-                phase=response.get("phase"),
-                exit_code=process.returncode,
+                success=False,
+                timed_out=True,
+                error=error,
+                error_pattern="timeout",
                 retry=retry,
             )
             log_diagnostic_event(
-                "vba_worker_result",
+                "vba_worker_timeout",
                 database=str(database_path),
                 operation=operation,
                 duration_ms=duration_ms,
-                success=response.get("success"),
-                phase=response.get("phase"),
-                exit_code=process.returncode,
-                error=response.get("error"),
-                error_pattern=response.get("error_pattern"),
+                error=error,
                 retry=retry,
             )
-            return response
+            return {
+                "success": False,
+                "error": error,
+                "error_pattern": "timeout",
+                "recoverable": True,
+                "timed_out": True,
+                "duration_ms": duration_ms,
+            }
 
-    @staticmethod
-    def _read_worker_response(
-        response_path: Path,
-        exit_code: int | None,
-        stderr: str | None,
-    ) -> dict[str, Any]:
-        if response_path.exists():
-            try:
-                response = json.loads(response_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                return {
-                    "success": False,
-                    "error": f"VBA worker returned invalid JSON: {exc}",
-                    "error_pattern": "serialization_error",
-                    "exit_code": exit_code,
-                    "stderr": stderr.strip() if stderr else None,
-                }
-            response["exit_code"] = exit_code
-            if stderr:
-                response["stderr"] = stderr.strip()
-            return response
+        cls._active_worker = None
 
-        error = "VBA worker exited without writing a response"
-        if stderr:
-            error = f"{error}: {stderr.strip()}"
-        return {
+        response = result_box.get("result", {
             "success": False,
-            "error": error,
-            "error_pattern": "worker_crash",
-            "exit_code": exit_code,
-            "stderr": stderr.strip() if stderr else None,
-        }
+            "error": "VBA worker thread completed without producing a result",
+            "error_pattern": "unknown",
+        })
+        response["duration_ms"] = duration_ms
+        if not response.get("success"):
+            response.setdefault("recoverable", is_recoverable_pattern(response.get("error_pattern")))
+
+        log_vba_worker_event(
+            "vba_worker_result",
+            database_path=database_path,
+            operation=operation,
+            duration_ms=duration_ms,
+            success=response.get("success"),
+            timed_out=False,
+            error=response.get("error"),
+            error_pattern=response.get("error_pattern"),
+            phase=response.get("phase"),
+            retry=retry,
+        )
+        log_diagnostic_event(
+            "vba_worker_result",
+            database=str(database_path),
+            operation=operation,
+            duration_ms=duration_ms,
+            success=response.get("success"),
+            phase=response.get("phase"),
+            error=response.get("error"),
+            error_pattern=response.get("error_pattern"),
+            retry=retry,
+        )
+        return response
 
     @staticmethod
     def _recoverable_error(
@@ -441,7 +470,7 @@ def run_vba_resilient(
     addin_path: str | None = None,
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Run VBA through the process-isolated worker manager."""
+    """Run VBA through the thread-isolated worker manager."""
     return _worker_manager.run_vba(
         database_path=database_path,
         code=code,

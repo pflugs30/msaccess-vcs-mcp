@@ -1,11 +1,11 @@
-"""Tests for isolated VBA worker process management and COM recovery."""
+"""Tests for thread-based VBA worker management and COM recovery."""
 
 from __future__ import annotations
 
-import json
-import subprocess
 import asyncio
-from pathlib import Path
+import threading
+import time
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -15,51 +15,55 @@ from msaccess_vcs_mcp.vba_worker_manager import VBAWorkerManager
 
 
 @pytest.fixture(autouse=True)
-def _reset_recovery_state():
+def _reset_recovery_and_worker():
     get_recovery_manager().reset()
+    VBAWorkerManager._active_worker = None
     yield
     get_recovery_manager().reset()
+    VBAWorkerManager._active_worker = None
 
 
-class FakeProcess:
-    """Small subprocess.Popen stand-in that reads/writes worker temp files."""
+def _patch_worker_thread(monkeypatch, results: list[dict]):
+    """Replace the worker's thread body with a synchronous result feeder.
 
-    def __init__(self, command: list[str], action: dict):
-        self.command = command
-        self.action = action
-        self.returncode = action.get("returncode", 0)
-        self.killed = False
-        self.request_path = Path(command[-2])
-        self.response_path = Path(command[-1])
-        self.request = json.loads(self.request_path.read_text(encoding="utf-8"))
+    Each call to ``_run_worker`` pops the next result dict from *results*
+    and stuffs it into the ``result_box`` that the real thread body would
+    write.  The thread itself is a no-op so the test never touches COM.
+    """
+    call_log: list[dict] = []
+    real_run_worker = VBAWorkerManager._run_worker
 
-        if not action.get("timeout") and action.get("write_response", True):
-            self.response_path.write_text(
-                json.dumps(action["response"]),
-                encoding="utf-8",
-            )
+    def fake_run_worker(self, *, operation, database_path, addin_path,
+                        code, timeout_seconds, retry=False):
+        call_log.append({
+            "operation": operation,
+            "database_path": database_path,
+            "code": code,
+            "retry": retry,
+        })
+        if results and results[0].get("timeout"):
+            result = results.pop(0)
+            return {
+                "success": False,
+                "error": f"VBA worker timed out after {timeout_seconds} seconds",
+                "error_pattern": "timeout",
+                "recoverable": True,
+                "timed_out": True,
+                "duration_ms": 100.0,
+            }
+        if results:
+            response = dict(results.pop(0))
+            response.setdefault("duration_ms", 10.0)
+            return response
+        return {"success": False, "error": "No more fake results", "error_pattern": "unknown"}
 
-    def communicate(self, timeout=None):
-        if self.action.get("timeout") and not self.killed:
-            raise subprocess.TimeoutExpired(self.command, timeout)
-        return "", self.action.get("stderr", "")
-
-    def kill(self):
-        self.killed = True
-        self.returncode = -9
+    monkeypatch.setattr(VBAWorkerManager, "_run_worker", fake_run_worker)
+    return call_log
 
 
-def install_fake_popen(monkeypatch, actions: list[dict]) -> list[FakeProcess]:
-    calls: list[FakeProcess] = []
-
-    def fake_popen(command, stdout=None, stderr=None, text=None):
-        process = FakeProcess(command, actions.pop(0))
-        calls.append(process)
-        return process
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    return calls
-
+# ------------------------------------------------------------------
+# COM error classification (unchanged)
+# ------------------------------------------------------------------
 
 def test_classifies_recoverable_com_errors():
     assert classify_com_error("The RPC server is unavailable (-2147023174)") == "rpc_unavailable"
@@ -69,18 +73,20 @@ def test_classifies_recoverable_com_errors():
     assert classify_com_error("Operation timed out after 45 seconds") == "timeout"
 
 
-def test_run_vba_success_uses_worker(monkeypatch):
-    actions = [
+# ------------------------------------------------------------------
+# Happy path
+# ------------------------------------------------------------------
+
+def test_run_vba_success(monkeypatch):
+    results = [
         {
-            "response": {
-                "success": True,
-                "operation": "run_vba",
-                "phase": "run_vba",
-                "result": '{"success": true, "result": 42}',
-            }
+            "success": True,
+            "operation": "run_vba",
+            "phase": "run_vba",
+            "result": '{"success": true, "result": 42}',
         }
     ]
-    calls = install_fake_popen(monkeypatch, actions)
+    calls = _patch_worker_thread(monkeypatch, results)
 
     manager = VBAWorkerManager()
     result = manager.run_vba(
@@ -92,13 +98,17 @@ def test_run_vba_success_uses_worker(monkeypatch):
 
     assert result["success"] is True
     assert result["result"] == '{"success": true, "result": 42}'
-    assert calls[0].request["operation"] == "run_vba"
-    assert calls[0].request["code"] == "MCP_TempFunction = 42"
+    assert calls[0]["operation"] == "run_vba"
+    assert calls[0]["code"] == "MCP_TempFunction = 42"
 
 
-def test_run_vba_timeout_kills_only_worker(monkeypatch):
-    actions = [{"timeout": True, "stderr": "Access did not respond"}]
-    calls = install_fake_popen(monkeypatch, actions)
+# ------------------------------------------------------------------
+# Timeout
+# ------------------------------------------------------------------
+
+def test_run_vba_timeout_returns_recoverable(monkeypatch):
+    results = [{"timeout": True}]
+    _patch_worker_thread(monkeypatch, results)
 
     manager = VBAWorkerManager()
     result = manager.run_vba(
@@ -111,9 +121,12 @@ def test_run_vba_timeout_kills_only_worker(monkeypatch):
     assert result["timed_out"] is True
     assert result["recoverable"] is True
     assert result["error_pattern"] == "timeout"
-    assert calls[0].killed is True
     assert get_recovery_manager().get_state("C:\\db.accdb").status == "timed_out"
 
+
+# ------------------------------------------------------------------
+# Recovery probe after prior timeout
+# ------------------------------------------------------------------
 
 def test_next_call_probes_after_prior_timeout(monkeypatch):
     get_recovery_manager().mark_failure(
@@ -122,25 +135,21 @@ def test_next_call_probes_after_prior_timeout(monkeypatch):
         "timeout",
         timed_out=True,
     )
-    actions = [
+    results = [
         {
-            "response": {
-                "success": True,
-                "operation": "probe",
-                "phase": "load_addin",
-                "result": "ok",
-            }
+            "success": True,
+            "operation": "probe",
+            "phase": "load_addin",
+            "result": "ok",
         },
         {
-            "response": {
-                "success": True,
-                "operation": "run_vba",
-                "phase": "run_vba",
-                "result": "done",
-            }
+            "success": True,
+            "operation": "run_vba",
+            "phase": "run_vba",
+            "result": "done",
         },
     ]
-    calls = install_fake_popen(monkeypatch, actions)
+    calls = _patch_worker_thread(monkeypatch, results)
 
     manager = VBAWorkerManager()
     result = manager.run_vba(
@@ -150,40 +159,37 @@ def test_next_call_probes_after_prior_timeout(monkeypatch):
     )
 
     assert result["success"] is True
-    assert [call.request["operation"] for call in calls] == ["probe", "run_vba"]
+    assert [c["operation"] for c in calls] == ["probe", "run_vba"]
     assert get_recovery_manager().get_state("C:\\db.accdb").status == "healthy"
 
 
+# ------------------------------------------------------------------
+# Pre-dispatch disconnect -> probe + retry
+# ------------------------------------------------------------------
+
 def test_predispatch_disconnect_probes_and_retries_once(monkeypatch):
-    actions = [
+    results = [
         {
-            "returncode": 1,
-            "response": {
-                "success": False,
-                "operation": "run_vba",
-                "phase": "connect",
-                "error": "The RPC server is unavailable",
-                "error_pattern": "rpc_unavailable",
-            },
+            "success": False,
+            "operation": "run_vba",
+            "phase": "connect",
+            "error": "The RPC server is unavailable",
+            "error_pattern": "rpc_unavailable",
         },
         {
-            "response": {
-                "success": True,
-                "operation": "probe",
-                "phase": "load_addin",
-                "result": "ok",
-            }
+            "success": True,
+            "operation": "probe",
+            "phase": "load_addin",
+            "result": "ok",
         },
         {
-            "response": {
-                "success": True,
-                "operation": "run_vba",
-                "phase": "run_vba",
-                "result": "retried",
-            }
+            "success": True,
+            "operation": "run_vba",
+            "phase": "run_vba",
+            "result": "retried",
         },
     ]
-    calls = install_fake_popen(monkeypatch, actions)
+    calls = _patch_worker_thread(monkeypatch, results)
 
     manager = VBAWorkerManager()
     result = manager.run_vba(
@@ -194,23 +200,24 @@ def test_predispatch_disconnect_probes_and_retries_once(monkeypatch):
 
     assert result["success"] is True
     assert result["result"] == "retried"
-    assert [call.request["operation"] for call in calls] == ["run_vba", "probe", "run_vba"]
+    assert [c["operation"] for c in calls] == ["run_vba", "probe", "run_vba"]
 
+
+# ------------------------------------------------------------------
+# run_vba phase failure is NOT retried
+# ------------------------------------------------------------------
 
 def test_run_phase_failure_is_not_retried(monkeypatch):
-    actions = [
+    results = [
         {
-            "returncode": 1,
-            "response": {
-                "success": False,
-                "operation": "run_vba",
-                "phase": "run_vba",
-                "error": "Call was rejected by callee",
-                "error_pattern": "call_rejected",
-            },
+            "success": False,
+            "operation": "run_vba",
+            "phase": "run_vba",
+            "error": "Call was rejected by callee",
+            "error_pattern": "call_rejected",
         }
     ]
-    calls = install_fake_popen(monkeypatch, actions)
+    calls = _patch_worker_thread(monkeypatch, results)
 
     manager = VBAWorkerManager()
     result = manager.run_vba(
@@ -224,6 +231,37 @@ def test_run_phase_failure_is_not_retried(monkeypatch):
     assert result["phase"] == "run_vba"
     assert len(calls) == 1
 
+
+# ------------------------------------------------------------------
+# Active-worker single-flight guard
+# ------------------------------------------------------------------
+
+def test_active_worker_guard_returns_error():
+    stop = threading.Event()
+    holding = threading.Thread(target=stop.wait, daemon=True)
+    holding.start()
+    try:
+        VBAWorkerManager._active_worker = holding
+        manager = VBAWorkerManager()
+        result = manager._run_worker(
+            operation="run_vba",
+            database_path="C:\\db.accdb",
+            addin_path=None,
+            code="x = 1",
+            timeout_seconds=1,
+        )
+        assert result["success"] is False
+        assert "still running" in result["error"]
+        assert result["error_pattern"] == "access_unresponsive"
+    finally:
+        stop.set()
+        holding.join(timeout=1)
+        VBAWorkerManager._active_worker = None
+
+
+# ------------------------------------------------------------------
+# tools.py integration (result semantics preserved)
+# ------------------------------------------------------------------
 
 def test_vcs_run_vba_preserves_json_result_semantics(tmp_path, monkeypatch):
     db_path = tmp_path / "test.accdb"

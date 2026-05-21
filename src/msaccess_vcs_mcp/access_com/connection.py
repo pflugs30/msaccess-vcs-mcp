@@ -10,7 +10,9 @@ Key Complexity Areas:
 - COM cleanup challenges and garbage collection issues
 """
 
+import os
 import re
+import sys
 from typing import Any
 
 try:
@@ -19,6 +21,14 @@ try:
     COM_AVAILABLE = True
 except ImportError:
     COM_AVAILABLE = False
+
+
+def _paths_match(a: str, b: str) -> bool:
+    """Case-insensitive, normalised path comparison."""
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except (OSError, ValueError):
+        return False
 
 
 class AccessConnection:
@@ -58,29 +68,72 @@ class AccessConnection:
         
         Uses a multi-step approach:
         1. Try GetObject(path) to connect to our database if already open
-        2. If Access has a DIFFERENT database open, create NEW instance (don't interfere)
-        3. If no Access running, create new instance
+        2. Try EnsureDispatch -- but check whether it returned an existing
+           user instance (has a different database open) vs a fresh one
+        3. If EnsureDispatch attached to a user instance with a different
+           DB, fall back to DispatchEx to create a guaranteed-isolated
+           Access process
         
         IMPORTANT: Access can only have ONE database open at a time.
-        - If user has OUR database open → connect to their instance
-        - If user has DIFFERENT database open → create our OWN instance
-        - If no Access running → create our OWN instance
+        - If user has OUR database open -> connect to their instance
+        - If user has DIFFERENT database open -> create our OWN isolated instance
+        - If no Access running -> create new instance
+        
+        The ownership check after EnsureDispatch prevents the dangerous
+        scenario where close() calls Quit() on the user's Access window
+        (ported from db-inspector-mcp's DispatchEx fallback pattern).
         """
         if self._app is None:
             try:
-                # First, try to get the specific database file directly using GetObject
-                # This will work if the database is already open in any Access instance
-                # GetObject(path) finds the running instance with that database open
                 self._app = win32com.client.GetObject(self._db_path)
                 self._db_opened_via_getobject = True
-                self._owns_app = False  # User's Access instance - do NOT close it
+                self._owns_app = False
             except Exception:
-                # Database not open in any Access instance - create our own instance
-                # Use EnsureDispatch for early binding which fixes Application.Run
-                self._app = gencache.EnsureDispatch("Access.Application")
+                self._app = self._create_or_reuse_instance()
                 self._db_opened_via_getobject = False
-                self._owns_app = True  # We created this - we're responsible for cleanup
         return self._app
+
+    def _create_or_reuse_instance(self):
+        """Create or attach to an Access instance with correct ownership.
+
+        EnsureDispatch("Access.Application") can silently return an
+        existing user-owned instance instead of creating a new one.
+        We must check whether the returned instance already has a
+        database open to set _owns_app correctly.
+        """
+        app = gencache.EnsureDispatch("Access.Application")
+
+        try:
+            existing_db = app.CurrentDb()
+        except Exception:
+            existing_db = None
+
+        if existing_db is not None:
+            if _paths_match(existing_db.Name, self._db_path):
+                self._owns_app = False
+                return app
+            db_name = os.path.basename(self._db_path)
+            other_name = os.path.basename(existing_db.Name)
+            print(
+                f"[{db_name}] EnsureDispatch returned instance with "
+                f"'{other_name}' open -- launching isolated instance via DispatchEx",
+                file=sys.stderr,
+            )
+            return self._create_isolated_instance()
+
+        self._owns_app = True
+        return app
+
+    def _create_isolated_instance(self):
+        """Create a guaranteed-isolated Access process via DispatchEx.
+
+        Unlike EnsureDispatch, DispatchEx always spawns a new COM server
+        process independent of any existing Access instance.
+        """
+        app = win32com.client.DispatchEx("Access.Application")
+        app.UserControl = True
+        self._owns_app = True
+        return app
     
     def _get_current_db(self):
         """
