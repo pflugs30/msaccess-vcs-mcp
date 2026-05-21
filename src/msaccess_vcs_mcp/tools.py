@@ -1758,6 +1758,102 @@ def vcs_get_log(
         return {"success": False, "error": str(e)}
 
 
+@vcs_tool("vcs_run_tests")
+def vcs_run_tests(
+    database_path: str,
+    filter: str | None = None,
+) -> dict[str, Any]:
+    """
+    Run VBA tests in the database using the VCS add-in's built-in test runner.
+
+    Discovers test modules (standard modules and classes containing TestAssert
+    calls), executes their test procedures, and returns structured JSON results
+    with per-test status, assertion details, timing, and tags.
+
+    **Filter syntax** (comma-separated, applied as a single string):
+
+    Each comma-separated element is resolved in priority order:
+    1. Module name -- exact match (e.g. ``modTestEncoding``)
+    2. Suite/folder -- match against ``@Folder`` annotations (e.g. ``SQL``)
+    3. Procedure name -- match on procedure or ``Module.Procedure`` key
+    4. Tag -- match against ``@Tag`` annotations (e.g. ``unit``)
+
+    Prefix any element with ``-`` to exclude. Inclusions combine with OR;
+    exclusions combine with AND.
+
+    **Iterative workflow:** The response includes per-test entries keyed by
+    ``Module.Procedure``. To rerun only failures, pass those keys back as
+    the filter (e.g. ``"modTestFoo.TestBar,clsTestBaz.TestQux"``).
+
+    **Prerequisite:** The target database must have ``modTestAssert`` installed
+    (via the VCS ribbon or ``VCS.InstallTestAssertModule``). In unattended mode
+    the install prompt is suppressed, so pre-install before calling this tool.
+
+    Examples:
+        vcs_run_tests("C:\\\\db.accdb")
+        vcs_run_tests("C:\\\\db.accdb", filter="modTestEncoding")
+        vcs_run_tests("C:\\\\db.accdb", filter="SQL,-slow")
+        vcs_run_tests("C:\\\\db.accdb", filter="modTestFoo.TestSpecificProc")
+
+    Args:
+        database_path: Path to Access database (.accdb, .accda, .mdb)
+        filter: Optional comma-separated filter string. When omitted, runs
+            all tests.
+
+    Returns:
+        Dictionary with ``success`` (True when all tests pass, none errored,
+        and at least one test ran), ``summary``, ``tests``, ``durationMs``,
+        and other fields from the test runner JSON output.
+    """
+    try:
+        db_path = validate_database_path(database_path)
+
+        with AccessConnection(str(db_path)) as conn:
+            app, db = conn.connect()
+
+            config = get_config()
+            addin = VCSAddinIntegration(config.get("ACCESS_VCS_ADDIN_PATH"))
+            addin.load_addin(app, db_path=str(db_path))
+
+            # Silent mode: suppress MsgBox dialogs during test run
+            addin_lib = os.path.splitext(os.path.abspath(addin.addin_path))[0]
+            app.Run(f"{addin_lib}.SetInteractionMode", 1)
+
+            # Set the filter option (session-scoped, does not modify user's vcs-options.json)
+            addin.call_sync("SetOption", "DefaultTestFilter", filter or "")
+
+            result_json = addin.call_sync("RunFilteredTests")
+
+            if not result_json or (isinstance(result_json, str) and not result_json.strip()):
+                return {
+                    "success": False,
+                    "error": (
+                        "Test runner returned no results. Ensure modTestAssert is "
+                        "installed in the target database and that test modules "
+                        "contain TestAssert calls."
+                    ),
+                }
+
+            if isinstance(result_json, str):
+                try:
+                    parsed = json.loads(result_json)
+                except json.JSONDecodeError:
+                    return {"success": False, "error": f"Failed to parse test results JSON: {result_json[:200]}"}
+            else:
+                parsed = result_json if isinstance(result_json, dict) else {"result": result_json}
+
+            summary = parsed.get("summary", {})
+            parsed["success"] = (
+                summary.get("failed", 1) == 0
+                and summary.get("errored", 1) == 0
+                and summary.get("subs", 0) > 0
+            )
+            return parsed
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @vcs_tool("vcs_end_session")
 def vcs_end_session(
     database_path: str,
