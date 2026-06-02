@@ -89,7 +89,14 @@ write_file("C:\\mydb.src\\modules\\Utilities.bas", updated_code)
 # 5. Merge changes back
 vcs_import_objects("C:\\mydb.accdb", "C:\\mydb.src")
 
-# 6. Test the functions
+# 6. Compile to validate
+result = vcs_compile_vba("C:\\mydb.accdb")
+if not result["success"]:
+    # Stop — ask the user to Debug → Compile in the VBE and paste the
+    # code snippet around the highlighted error line. See agent_guidance.
+    pass
+
+# 7. Test the functions
 # (Open VBE and test the new/updated functions)
 ```
 
@@ -98,6 +105,7 @@ vcs_import_objects("C:\\mydb.accdb", "C:\\mydb.src")
 - Preserve the `Attribute VB_Name` header
 - Use Option Explicit for type safety
 - Include XML doc comments for functions
+- If `vcs_compile_vba` fails, stop editing and ask the user to **Debug → Compile** in the VBE, then paste the code snippet around the highlighted line
 
 ### 3. Create a New Database Object
 

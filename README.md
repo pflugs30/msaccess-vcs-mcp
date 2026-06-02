@@ -365,7 +365,14 @@ result = vcs_check_vba_compiled("C:\\db.accdb")
 
 Compile all VBA modules in an Access database and return success status.
 
-If compilation fails, do not proceed with code edits as there are existing compilation errors that must be fixed first.
+When compilation fails, MCP cannot report the failing module or line. **Stop
+making further code changes.** Ask the user to open the database in Access,
+open the Visual Basic Editor, and choose **Debug → Compile** — Access navigates
+to the first error line. Ask the user to paste the code around that line (a few
+lines above and below). Once you have the snippet, propose a targeted fix; do not
+guess or iterate through speculative edits.
+
+The response includes an `agent_guidance` field when compilation fails.
 
 **Args:**
 - `database_path`: Path to Access database

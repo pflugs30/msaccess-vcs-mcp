@@ -57,6 +57,21 @@ from .security import (
 from .usage_logging import log_code_execution, log_diagnostic_event, with_logging
 from .vba_worker_manager import run_vba_resilient
 
+_COMPILE_FAILURE_AGENT_GUIDANCE = (
+    "Compilation failed. MCP cannot report the failing module or line. "
+    "Stop editing source files. Ask the user to compile in the VBE "
+    "(Debug → Compile) — Access will jump to the error line. "
+    "Ask the user to paste the code snippet around that line (a few lines "
+    "above and below). Do not guess fixes or iterate blindly."
+)
+
+_NOT_COMPILED_AGENT_GUIDANCE = (
+    "The VBA project is not compiled. MCP cannot report the failing module or line. "
+    "Before proceeding with code edits, ask the user to compile in the VBE "
+    "(Debug → Compile) and paste the code snippet around any error line, "
+    "or confirm the project compiles cleanly."
+)
+
 
 def _get_operation_manager():
     """Get the operation manager instance if available."""
@@ -125,6 +140,50 @@ mcp = FastMCP(
         "must close every open Access window first, then run the add-in's own build "
         "process. After the user confirms the rebuild is complete, you can re-run "
         "verification steps (export/import/rebuild of target databases) through the MCP.\n\n"
+        "**VBA compile failures:**\n"
+        "MCP compile tools return success/failure only — not the failing module or line. "
+        "When vcs_compile_vba returns success=false (or vcs_check_vba_compiled shows "
+        "compiled=false), stop editing source files. Ask the user to compile in the VBE "
+        "(Debug → Compile); Access navigates to the error line. Wait for the user to "
+        "paste the code snippet around that line before proposing a fix. Do not guess "
+        "or iterate through speculative edits.\n\n"
+        "**Tool quick-reference (required parameters marked with *, optional with ?):**\n"
+        "- vcs_get_version_info() — server, add-in, and Access version info\n"
+        "- vcs_list_objects(database_path*) — list all objects by type\n"
+        "- vcs_export_database(database_path*, output_dir*, object_types?, full_export?) "
+        "— export all objects to source files\n"
+        "- vcs_export_object(database_path*, object_type*, object_name?) "
+        "— export a single object/type to source\n"
+        "- vcs_import_objects(database_path*, source_dir*, object_types?, overwrite?) "
+        "— import/merge source files into database\n"
+        "- vcs_import_object(database_path*, object_type*, object_name?) "
+        "— import a single object/type from source\n"
+        "- vcs_rebuild_database(source_dir*, output_path*, template_path?) "
+        "— build fresh database from source\n"
+        "- vcs_diff_database(database_path*, source_dir*, show_details?) "
+        "— compare database against source files\n"
+        "- vcs_run_vba(database_path*, code*, timeout_seconds?) "
+        "— execute agent-generated VBA in a temporary module\n"
+        "- vcs_call_vba(database_path*, function_name*, args?) "
+        "— call an existing public VBA function\n"
+        "- vcs_execute_sql(database_path*, sql*, max_rows?) "
+        "— run a read-only SELECT query via DAO\n"
+        "- vcs_run_tests(database_path*, filter?) — run VBA tests\n"
+        "- vcs_compile_vba(database_path*, suppress_warnings?) — compile all VBA modules\n"
+        "- vcs_check_vba_compiled(database_path*) — check VBA compilation status\n"
+        "- vcs_get_option(database_path*, option_name*) — read a VCS option value\n"
+        "- vcs_set_option(database_path*, option_name*, value*) "
+        "— set a VCS option for this session\n"
+        "- vcs_get_log(database_path*, log_type?) — read Export or Build log\n"
+        "- vcs_end_session(database_path*) — end session, remove option overrides\n"
+        "- vcs_cancel_operation(operation_id*) — cancel a running async operation\n\n"
+        "**Common mistakes to avoid:**\n"
+        "- Almost every tool requires database_path* — pass the full .accdb path.\n"
+        "- vcs_run_vba() executes arbitrary VBA code you provide in the code* parameter. "
+        "Do NOT guess tool names like vcs_eval, vcs_execute_code, or vcs_run_code — "
+        "they do not exist.\n"
+        "- vcs_run_vba() returns values via a MCP_TempFunction pattern — "
+        "read the full tool description for details.\n\n"
         "**Logs:**\n"
         "Two JSON Lines streams (both prefixed `vcs-mcp-` so they don't collide with "
         "other tools' logs in a shared directory).\n"
@@ -1163,6 +1222,8 @@ def vcs_check_vba_compiled(database_path: str) -> dict[str, Any]:
         Dictionary with:
         - success: Boolean indicating if the check completed successfully
         - compiled: Boolean - True if project is compiled, False otherwise
+        - agent_guidance: Present when compiled is False — hand off to the user
+          via VBE compile before proceeding with edits
         - error: Error message if check failed
     """
     try:
@@ -1180,10 +1241,13 @@ def vcs_check_vba_compiled(database_path: str) -> dict[str, Any]:
             # Call IsVBACompiled API
             is_compiled = addin.call_sync("IsVBACompiled")
             
-            return {
+            result: dict[str, Any] = {
                 "success": True,
                 "compiled": bool(is_compiled),
             }
+            if not is_compiled:
+                result["agent_guidance"] = _NOT_COMPILED_AGENT_GUIDANCE
+            return result
     
     except Exception as e:
         return {
@@ -1204,8 +1268,16 @@ def vcs_compile_vba(
     Attempts to compile all VBA code in the database. Returns True if compilation
     succeeded (project is compiled), False if compilation failed.
     
-    **Important:** If compilation fails, do not proceed with code edits as there
-    are existing compilation errors that must be fixed first.
+    MCP cannot report the failing module or line. When compilation fails:
+    
+    1. **Stop** — do not import more changes, edit `.bas`/`.cls` files
+       speculatively, or run trial-and-error fixes.
+    2. **Ask the user** to open the database in Access, open the VBE, and run
+       **Debug → Compile** (toolbar compile button). Access highlights the
+       first error line.
+    3. **Ask the user** to paste the code snippet around that line (±5 lines
+       is enough; full error text is optional).
+    4. **Then** fix the identified issue in source and re-import / re-compile.
     
     Examples:
         # Compile VBA code
@@ -1213,7 +1285,7 @@ def vcs_compile_vba(
         if result["success"]:
             print("Compilation successful!")
         else:
-            print("Compilation failed - do not proceed with edits")
+            print(result["agent_guidance"])
     
     Args:
         database_path: Path to Access database (.accdb, .accda, .mdb)
@@ -1224,6 +1296,8 @@ def vcs_compile_vba(
         Dictionary with:
         - success: Boolean - True if compilation succeeded (project is compiled),
                   False if compilation failed
+        - agent_guidance: Present when success is False — stop and hand off to
+          the user via VBE compile before editing source
         - error: Error message if compilation check failed
     """
     try:
@@ -1241,14 +1315,19 @@ def vcs_compile_vba(
             # Call CompileVBA API with suppress_warnings parameter
             compile_result = addin.call_sync("CompileVBA", suppress_warnings)
             
+            if compile_result:
+                return {"success": True}
+
             return {
-                "success": bool(compile_result),
+                "success": False,
+                "agent_guidance": _COMPILE_FAILURE_AGENT_GUIDANCE,
             }
     
     except Exception as e:
         return {
             "success": False,
             "error": str(e),
+            "agent_guidance": _COMPILE_FAILURE_AGENT_GUIDANCE,
         }
 
 
@@ -1548,6 +1627,14 @@ def vcs_run_vba(
     Each `Erl` value inside the handler is meaningful (and matches an
     `errorLine` you would have seen) because the wrapper auto-numbered
     every line for you.
+    
+    **Host-project compile failures:**
+    If the response includes `compileError` stating the host project does not
+    compile on its own, the failure is in existing database VBA — not your
+    submitted `code`. Stop and ask the user to compile in the VBE (Debug →
+    Compile) and paste the code snippet around the highlighted line. Do not
+    treat `generatedSource` as the fix target unless the response says the
+    failure is in the agent code.
     
     Examples:
         vcs_run_vba("C:\\\\db.accdb", "MCP_TempFunction = CurrentDb.TableDefs.Count")
